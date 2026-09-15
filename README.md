@@ -1,43 +1,11 @@
 # OpenVPN on Amazon Linux 2023
 
 **Author:** Mureed Qasim Shah  
-**Organization:** GoCompliance  
-**Plugin:** [openvpn-auth-oauth2](https://github.com/jkroepke/openvpn-auth-oauth2) v1.27.4+  
-**Identity provider:** Google OAuth2 / OIDC
+**Organization:** GoCompliance
 
 Use the [angristan/openvpn-install](https://github.com/angristan/openvpn-install) script. It installs OpenVPN, generates the PKI, and writes client `.ovpn` files. Do not build Easy-RSA or `server.conf` by hand.
 
----
-
-## Security advisory — CVE-2026-41070
-
-**CVE-2026-41070** is **CRITICAL (CVSS 9.5)**. It affects `openvpn-auth-oauth2` **via-env** script mode (`auth-user-pass-verify via-env` with `script-security 3`).
-
-| Detail | Value |
-| --- | --- |
-| CVE ID | CVE-2026-41070 |
-| CVSS | 9.5 / 10.0 — CRITICAL |
-| Affected mode | `via-env` (`auth-user-pass-verify via-env`) |
-| Safe mode | Management interface (`tcp://127.0.0.1:1195`) |
-| Fixed version | v1.27.3 and above (this guide uses **v1.27.4**) |
-
-Never use `auth-user-pass-verify /path/binary via-env` with `script-security 3`. This setup uses the management interface only, which is not affected.
-
----
-
-## How it works
-
-When a client connects, OpenVPN talks to `openvpn-auth-oauth2` on a local TCP socket. The user signs in with Google in a browser. The plugin tells OpenVPN ALLOW or DENY. Credentials never go through environment variables.
-
-| Step | Component | Action |
-| --- | --- | --- |
-| 1 | VPN client | Connects to OpenVPN on UDP 1194 |
-| 2 | OpenVPN server | Signals auth-oauth2 on TCP 1195 (management interface) |
-| 3 | auth-oauth2 | Sends a browser login URL to the client |
-| 4 | User browser | User logs in with Google |
-| 5 | Google OAuth2 | Returns a token to the callback on port 9000 |
-| 6 | auth-oauth2 | Validates the token, reports ALLOW or DENY |
-| 7 | OpenVPN server | Grants or rejects the tunnel |
+Auth is certificate-based (`.ovpn` profile). There is no SSO.
 
 ---
 
@@ -55,10 +23,6 @@ When a client connects, OpenVPN talks to `openvpn-auth-oauth2` on a local TCP so
 | TCP | 22 | Your IP/32 | SSH |
 | UDP | 1194 | 0.0.0.0/0 | OpenVPN |
 | TCP | 1194 | 0.0.0.0/0 | OpenVPN TCP fallback |
-| TCP | 443 | Your IP/32 | HTTPS admin |
-| TCP | 9000 | 0.0.0.0/0 | OAuth2 callback |
-
-You also need a Google account that can use Google Cloud Console (Workspace or personal).
 
 ---
 
@@ -181,4 +145,3 @@ sudo ./openvpn-install.sh client add alice --password
 
 - Keep `openvpn-install.sh` on the server. You will use it every time you add or revoke a client.
 - Do not commit `.ovpn` files, keys, or certificates.
-- If you enable `openvpn-auth-oauth2`, stay on **v1.27.4+** and the **management interface** (`tcp://127.0.0.1:1195`). Do not use `via-env`.
