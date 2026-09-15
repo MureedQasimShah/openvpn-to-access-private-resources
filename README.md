@@ -1,7 +1,6 @@
 # OpenVPN on Amazon Linux 2023
 
-**Author:** Mureed Qasim Shah  
-**Organization:** GoCompliance
+**Author:** Mureed Qasim Shah
 
 Use the [angristan/openvpn-install](https://github.com/angristan/openvpn-install) script. It installs OpenVPN, generates the PKI, and writes client `.ovpn` files. Do not build Easy-RSA or `server.conf` by hand.
 
