@@ -194,6 +194,27 @@ Remove any inbound SSH from `0.0.0.0/0` on these instances.
 - Default network ACLs (allow all) are enough.
 - You do **not** need a route table entry for `10.8.0.0/24` while NAT is on. Return traffic goes back to the VPN instance private IP, which already has a local VPC route.
 
+### Step 2b — Allow your VPC CIDR on the VPN box (required)
+
+The installer NATs internet traffic, then **REJECT**s RFC1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) so the VPN does not “leak” into random private LANs. Your VPC is also `10.x`, so SSH to a private instance (for example `10.20.3.105`) is rejected **on the VPN server** before it ever reaches that EC2.
+
+That shows up on your laptop as **connection refused**, not a timeout. Security groups are not the cause.
+
+On the VPN instance, allow your VPC CIDR **before** those REJECT rules (this example is `10.20.0.0/16` — use your real VPC CIDR):
+
+```bash
+sudo iptables -I OPENVPN_INSTALL_FORWARD 1 -s 10.8.0.0/24 -d 10.20.0.0/16 -j ACCEPT
+sudo iptables -t nat -I POSTROUTING 1 -s 10.8.0.0/24 -d 10.20.0.0/16 -j MASQUERADE
+```
+
+Confirm line 1 is ACCEPT to your VPC, and REJECT `10.0.0.0/8` sits **below** it:
+
+```bash
+sudo iptables -L OPENVPN_INSTALL_FORWARD -n -v --line-numbers
+```
+
+Add the same two `iptables` lines to `/etc/iptables/add-openvpn-rules.sh` or they disappear when OpenVPN restarts.
+
 ### Step 3 — Make sure the VPC CIDR is pushed to clients
 
 The installer usually enables full tunnel (`redirect-gateway`) and NATs everything out the VPN ENI, which is enough.
@@ -231,22 +252,57 @@ On Windows you can also use PuTTY: Host Name = the private IP, port `22`, auth w
 
 You should **not** be able to SSH to that private IP when the VPN is disconnected. That is expected.
 
-### Step 5 — If SSH still times out
+### Step 5 — Debug: `connection refused` vs timeout
 
-| Check | What to look for |
+| Symptom | Typical cause |
 | --- | --- |
-| VPN connected? | OpenVPN Connect shows connected; you have an address in `10.8.0.0/24` |
-| Destination | You used the **private** IP of the target EC2 |
-| `private-ec2-sg` | Inbound TCP 22 from `openvpn-sg` (or the VPN instance private `/32`) |
-| `openvpn-sg` outbound | Allows TCP 22 (default “all traffic” is fine) |
-| Same VPC | Both instances in the same VPC |
-| OS firewall on private EC2 | `firewalld`/`iptables` not dropping SSH (Amazon Linux is usually open) |
+| Hang / timeout | Security group, NACL, or wrong IP — packet never arrives |
+| `Connection refused` | Packet hit the VPN box (or host) and got **REJECT**. With this installer that is almost always the RFC1918 `REJECT` on `OPENVPN_INSTALL_FORWARD` |
 
-On the VPN server, confirm NAT is present:
+Internet through the VPN can work (`curl ifconfig.me` shows the VPN Elastic IP) while SSH to `10.20.x.x` fails. Public internet is ACCEPTed; `10.0.0.0/8` is REJECTed.
+
+**On your laptop** (VPN connected):
 
 ```bash
-sudo iptables -t nat -L POSTROUTING -n | grep 10.8.0.0
+nc -vz 10.20.3.105 22
+ssh -i servers.pem ec2-user@10.20.3.105
 ```
+
+**On the VPN server**, watch whether the SYN arrives on `tun0` and whether it is forwarded:
+
+```bash
+sudo tcpdump -ni any host 10.20.3.105 and port 22
+```
+
+Then run `nc -vz 10.20.3.105 22` on the laptop again.
+
+- SYN on `tun0` only (from `10.8.0.2` → `10.20.3.105:22`) and nothing out the ENI → iptables REJECT. That is this bug.
+- SYN on `tun0` **and** on `eth0`/`ens5` → forwarding works; check the private instance SG and `sshd`.
+
+List the chain (you should see REJECT `10.0.0.0/8` with packet counts when you retry SSH):
+
+```bash
+sudo iptables -L OPENVPN_INSTALL_FORWARD -n -v --line-numbers
+```
+
+Allow your VPC CIDR, then test again from the laptop:
+
+```bash
+sudo iptables -I OPENVPN_INSTALL_FORWARD 1 -s 10.8.0.0/24 -d 10.20.0.0/16 -j ACCEPT
+sudo iptables -t nat -I POSTROUTING 1 -s 10.8.0.0/24 -d 10.20.0.0/16 -j MASQUERADE
+
+sudo iptables -L OPENVPN_INSTALL_FORWARD -n -v --line-numbers
+```
+
+From the laptop:
+
+```bash
+nc -vz 10.20.3.105 22
+```
+
+`succeeded` means the path is open. Then SSH as usual.
+
+Quick extra check: SSH **from the VPN instance itself** to `ec2-user@10.20.3.105`. If that works but the laptop still gets refused, it is definitely the `tun0` FORWARD rules, not `sshd`.
 
 ---
 
