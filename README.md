@@ -101,13 +101,25 @@ Send that file over a private channel. Do not email it in the clear and do not c
 
 ### Step 3 — Import and connect
 
-Install [OpenVPN Connect](https://openvpn.net/client/) (Windows, macOS, Android, iOS) or use `openvpn --config alice.ovpn` on Linux. Import `alice.ovpn` and connect.
+**Windows**
 
-On Linux:
+1. Download and install [OpenVPN Connect](https://openvpn.net/client/) for Windows (the official OpenVPN client).
+2. Open **OpenVPN Connect**.
+3. Click the **+** button.
+4. Choose **Upload File** / **Import** and select `alice.ovpn`.
+5. Click the profile, then click **Connect**.
+
+The tray icon should show connected. The client gets an address in `10.8.0.0/24`.
+
+**Linux**
 
 ```bash
 sudo openvpn --config alice.ovpn
 ```
+
+**macOS / Android / iOS**
+
+Install [OpenVPN Connect](https://openvpn.net/client/), import `alice.ovpn`, and connect.
 
 ### Step 4 — Confirm on the server
 
