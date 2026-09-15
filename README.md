@@ -1,340 +1,184 @@
-# OpenVPN on Amazon Linux
+# OpenVPN on Amazon Linux 2023
 
-Step-by-step guide to install an **OpenVPN** server on **Amazon Linux 2023** (EC2) and add a new client.
+**Author:** Mureed Qasim Shah  
+**Organization:** GoCompliance  
+**Plugin:** [openvpn-auth-oauth2](https://github.com/jkroepke/openvpn-auth-oauth2) v1.27.4+  
+**Identity provider:** Google OAuth2 / OIDC
 
-This setup uses Easy-RSA for certificates, UDP port **1194**, and a VPN subnet of `10.8.0.0/24`.
+Use the [angristan/openvpn-install](https://github.com/angristan/openvpn-install) script. It installs OpenVPN, generates the PKI, and writes client `.ovpn` files. Do not build Easy-RSA or `server.conf` by hand.
 
-> Do not commit CA keys, server keys, or `.ovpn` files. Keep them only on the server and copy client profiles over a private channel (SCP).
+---
+
+## Security advisory — CVE-2026-41070
+
+**CVE-2026-41070** is **CRITICAL (CVSS 9.5)**. It affects `openvpn-auth-oauth2` **via-env** script mode (`auth-user-pass-verify via-env` with `script-security 3`).
+
+| Detail | Value |
+| --- | --- |
+| CVE ID | CVE-2026-41070 |
+| CVSS | 9.5 / 10.0 — CRITICAL |
+| Affected mode | `via-env` (`auth-user-pass-verify via-env`) |
+| Safe mode | Management interface (`tcp://127.0.0.1:1195`) |
+| Fixed version | v1.27.3 and above (this guide uses **v1.27.4**) |
+
+Never use `auth-user-pass-verify /path/binary via-env` with `script-security 3`. This setup uses the management interface only, which is not affected.
+
+---
+
+## How it works
+
+When a client connects, OpenVPN talks to `openvpn-auth-oauth2` on a local TCP socket. The user signs in with Google in a browser. The plugin tells OpenVPN ALLOW or DENY. Credentials never go through environment variables.
+
+| Step | Component | Action |
+| --- | --- | --- |
+| 1 | VPN client | Connects to OpenVPN on UDP 1194 |
+| 2 | OpenVPN server | Signals auth-oauth2 on TCP 1195 (management interface) |
+| 3 | auth-oauth2 | Sends a browser login URL to the client |
+| 4 | User browser | User logs in with Google |
+| 5 | Google OAuth2 | Returns a token to the callback on port 9000 |
+| 6 | auth-oauth2 | Validates the token, reports ALLOW or DENY |
+| 7 | OpenVPN server | Grants or rejects the tunnel |
 
 ---
 
 ## Prerequisites
 
-On AWS, launch an Amazon Linux 2023 instance (a `t3.micro` is enough for a small team).
+- EC2 — Amazon Linux 2023 (`t3.small` or larger)
+- Elastic IP on the instance
+- SSH with sudo
+- DNS A record: `pritunl.gocompliance.com` → Elastic IP
 
-1. Put the instance in a **public subnet** with a public IPv4 address.
-2. Attach an **Elastic IP** so the VPN hostname/IP does not change.
-3. Security group inbound rules:
-   - SSH: TCP `22` from your IP
-   - OpenVPN: **UDP `1194`** from `0.0.0.0/0` (or lock it down to known client IPs)
-4. Disable source/destination check (required so the instance can NAT VPN traffic):
+**Security group**
 
-```bash
-aws ec2 modify-instance-attribute \
-  --instance-id i-xxxxxxxxxxxxxxxxx \
-  --no-source-dest-check
-```
+| Protocol | Port | Source | Purpose |
+| --- | --- | --- | --- |
+| TCP | 22 | Your IP/32 | SSH |
+| UDP | 1194 | 0.0.0.0/0 | OpenVPN |
+| TCP | 1194 | 0.0.0.0/0 | OpenVPN TCP fallback |
+| TCP | 443 | Your IP/32 | HTTPS admin |
+| TCP | 9000 | 0.0.0.0/0 | OAuth2 callback |
 
-SSH in as `ec2-user` before continuing.
+You also need a Google account that can use Google Cloud Console (Workspace or personal).
 
 ---
 
-## Part 1 — Install OpenVPN on Amazon Linux
+## 1. Install OpenVPN
 
-### 1. Install packages
+SSH into the instance as `ec2-user`.
 
-**Amazon Linux 2023:**
+### 1.1 Fix curl on Amazon Linux 2023
+
+AL2023 ships `curl-minimal`, which conflicts with full `curl`. Swap it first:
 
 ```bash
-sudo dnf update -y
-sudo dnf install -y openvpn iptables-services curl openssl tar wget
+sudo dnf swap curl-minimal curl --allowerasing -y
+curl --version
 ```
 
-**Amazon Linux 2** (older AMI; prefer AL2023):
+You should see curl 8.x with OpenSSL.
+
+### 1.2 Download and run the installer
 
 ```bash
-sudo yum update -y
-sudo amazon-linux-extras install epel -y
-sudo yum install -y openvpn iptables-services curl openssl tar wget
+curl -O https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
+chmod +x openvpn-install.sh
+sudo ./openvpn-install.sh install
 ```
 
-### 2. Install Easy-RSA
+That one command installs and starts OpenVPN with these defaults:
+
+| Setting | Value |
+| --- | --- |
+| Endpoint | Your Elastic / public IP |
+| Protocol | UDP |
+| Port | 1194 |
+| DNS | Cloudflare (`1.1.1.1`) |
+| Auth | PKI (certificate) |
+| VPN subnet | `10.8.0.0/24` |
+
+### 1.3 Verify it is running
 
 ```bash
-cd /tmp
-curl -LO https://github.com/OpenVPN/easy-rsa/releases/download/v3.2.6/EasyRSA-3.2.6.tgz
-sudo mkdir -p /etc/openvpn/easy-rsa
-sudo tar xzf EasyRSA-3.2.6.tgz -C /etc/openvpn/easy-rsa --strip-components=1
-sudo chown -R root:root /etc/openvpn/easy-rsa
-```
-
-### 3. Create the Certificate Authority and server certs
-
-```bash
-cd /etc/openvpn/easy-rsa
-
-sudo ./easyrsa init-pki
-sudo ./easyrsa --batch build-ca nopass
-sudo ./easyrsa --batch build-server-full server nopass
-sudo ./easyrsa gen-dh
-sudo ./easyrsa gen-crl
-sudo openvpn --genkey secret /etc/openvpn/easy-rsa/pki/tc.key
-```
-
-Copy the files OpenVPN will actually load (do not point the service at `/home`; systemd blocks that):
-
-```bash
-sudo mkdir -p /etc/openvpn/server /var/log/openvpn
-
-sudo cp /etc/openvpn/easy-rsa/pki/ca.crt /etc/openvpn/server/
-sudo cp /etc/openvpn/easy-rsa/pki/issued/server.crt /etc/openvpn/server/
-sudo cp /etc/openvpn/easy-rsa/pki/private/server.key /etc/openvpn/server/
-sudo cp /etc/openvpn/easy-rsa/pki/dh.pem /etc/openvpn/server/
-sudo cp /etc/openvpn/easy-rsa/pki/tc.key /etc/openvpn/server/
-sudo cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/server/
-
-sudo chmod 600 /etc/openvpn/server/server.key /etc/openvpn/server/tc.key
-sudo chmod 644 /etc/openvpn/server/crl.pem
-```
-
-### 4. Write the server config
-
-```bash
-sudo tee /etc/openvpn/server/server.conf > /dev/null << 'EOF'
-port 1194
-proto udp
-dev tun
-
-ca /etc/openvpn/server/ca.crt
-cert /etc/openvpn/server/server.crt
-key /etc/openvpn/server/server.key
-dh /etc/openvpn/server/dh.pem
-tls-crypt /etc/openvpn/server/tc.key
-crl-verify /etc/openvpn/server/crl.pem
-
-server 10.8.0.0 255.255.255.0
-ifconfig-pool-persist /etc/openvpn/server/ipp.txt
-
-# Send all client internet traffic through the VPN. Remove this line
-# if you only want access to AWS/VPC, not a full tunnel.
-push "redirect-gateway def1 bypass-dhcp"
-push "dhcp-option DNS 1.1.1.1"
-push "dhcp-option DNS 8.8.8.8"
-
-# Push your VPC CIDR so clients can reach private AWS resources.
-# Change this to match your VPC (example: 10.0.0.0/16).
-push "route 10.0.0.0 255.255.0.0"
-
-keepalive 10 120
-data-ciphers AES-256-GCM
-auth SHA256
-user nobody
-group nobody
-persist-key
-persist-tun
-topology subnet
-
-status /var/log/openvpn/openvpn-status.log
-log-append /var/log/openvpn/openvpn.log
-verb 3
-explicit-exit-notify 1
-EOF
-```
-
-If `group nobody` fails on your AMI, check groups with `getent group nobody openvpn` and change `group` to the one that exists.
-
-### 5. Enable IP forwarding and NAT
-
-```bash
-echo "net.ipv4.ip_forward = 1" | sudo tee /etc/sysctl.d/99-openvpn.conf
-sudo sysctl --system
-
-PRIMARY_IF=$(ip route show default | awk '{print $5; exit}')
-sudo iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o "$PRIMARY_IF" -j MASQUERADE 2>/dev/null \
-  || sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$PRIMARY_IF" -j MASQUERADE
-
-sudo iptables-save | sudo tee /etc/sysconfig/iptables
-sudo systemctl enable --now iptables
-```
-
-If you also need return traffic from other instances in the VPC to VPN clients (`10.8.0.0/24`), add a route in the VPC route table pointing `10.8.0.0/24` at this instance.
-
-### 6. Start OpenVPN
-
-Amazon Linux 2023:
-
-```bash
-sudo systemctl enable --now openvpn-server@server
-sudo systemctl status openvpn-server@server --no-pager
-```
-
-Amazon Linux 2 (if the unit above is missing):
-
-```bash
-sudo cp /etc/openvpn/server/server.conf /etc/openvpn/server.conf
-sudo systemctl enable --now openvpn@server
-sudo systemctl status openvpn@server --no-pager
-```
-
-Confirm it is listening:
-
-```bash
+sudo systemctl status openvpn-server@server
 sudo ss -ulnp | grep 1194
-sudo tail -n 50 /var/log/openvpn/openvpn.log
 ```
 
-You should see `Initialization Sequence Completed`.
+Status should be `active (running)`, and UDP 1194 should be listening.
 
 ---
 
-## Part 2 — Add a new client (step by step)
+## 2. Add a new client
 
-Do this **on the OpenVPN server** for every new user or device. Each client must have its own certificate.
+Run the **same installer** again. Replace `alice` with the person’s name (letters, numbers, hyphens).
 
-Replace `alice` with a short name: letters, numbers, and hyphens only (for example `alice-laptop`).
-
-### Step 1 — Create the client certificate
+### Step 1 — Create the client
 
 ```bash
-cd /etc/openvpn/easy-rsa
-sudo ./easyrsa --batch build-client-full alice nopass
+sudo ./openvpn-install.sh client add alice
 ```
 
-That writes:
+The profile is written to:
 
-- `/etc/openvpn/easy-rsa/pki/issued/alice.crt`
-- `/etc/openvpn/easy-rsa/pki/private/alice.key`
-
-### Step 2 — Set the public IP clients will connect to
-
-```bash
-# Elastic IP or the instance public IPv4
-VPN_SERVER_IP="YOUR.ELASTIC.IP.HERE"
-CLIENT_NAME="alice"
+```text
+/home/ec2-user/alice.ovpn
 ```
 
-### Step 3 — Build a single `.ovpn` profile
+### Step 2 — Copy it to their machine
 
-```bash
-sudo mkdir -p /etc/openvpn/client-configs
-
-sudo tee /etc/openvpn/client-configs/${CLIENT_NAME}.ovpn > /dev/null << EOF
-client
-dev tun
-proto udp
-remote ${VPN_SERVER_IP} 1194
-resolv-retry infinite
-nobind
-persist-key
-persist-tun
-remote-cert-tls server
-data-ciphers AES-256-GCM
-auth SHA256
-verb 3
-
-<ca>
-$(sudo cat /etc/openvpn/easy-rsa/pki/ca.crt)
-</ca>
-
-<cert>
-$(sudo cat /etc/openvpn/easy-rsa/pki/issued/${CLIENT_NAME}.crt)
-</cert>
-
-<key>
-$(sudo cat /etc/openvpn/easy-rsa/pki/private/${CLIENT_NAME}.key)
-</key>
-
-<tls-crypt>
-$(sudo cat /etc/openvpn/easy-rsa/pki/tc.key)
-</tls-crypt>
-EOF
-
-sudo chmod 600 /etc/openvpn/client-configs/${CLIENT_NAME}.ovpn
-ls -l /etc/openvpn/client-configs/${CLIENT_NAME}.ovpn
-```
-
-### Step 4 — Copy the profile to the client machine
-
-From **your laptop** (not the server):
+From your laptop:
 
 ```bash
 scp -i /path/to/your-key.pem \
-  ec2-user@YOUR.ELASTIC.IP.HERE:/etc/openvpn/client-configs/alice.ovpn \
+  ec2-user@YOUR.ELASTIC.IP.HERE:alice.ovpn \
   ~/Downloads/alice.ovpn
 ```
 
-If `scp` is denied because the file is root-owned, copy it to the home directory first on the server:
+Send that file over a private channel. Do not email it in the clear and do not commit it to git.
+
+### Step 3 — Import and connect
+
+Install [OpenVPN Connect](https://openvpn.net/client/) (Windows, macOS, Android, iOS) or use `openvpn --config alice.ovpn` on Linux. Import `alice.ovpn` and connect.
+
+On Linux:
 
 ```bash
-sudo cp /etc/openvpn/client-configs/alice.ovpn /home/ec2-user/alice.ovpn
-sudo chown ec2-user:ec2-user /home/ec2-user/alice.ovpn
-chmod 600 /home/ec2-user/alice.ovpn
+sudo openvpn --config alice.ovpn
 ```
 
-Then download `/home/ec2-user/alice.ovpn` and delete it from the server after transfer:
+### Step 4 — Confirm on the server
 
 ```bash
-rm /home/ec2-user/alice.ovpn
-```
-
-### Step 5 — Import and connect
-
-| Platform | Client |
-| --- | --- |
-| Windows / macOS | [OpenVPN Connect](https://openvpn.net/client/) |
-| Linux | `sudo dnf install -y openvpn` then `sudo openvpn --config alice.ovpn` |
-| Android / iOS | OpenVPN Connect from the store |
-
-Import `alice.ovpn` and connect. The client should get an address in `10.8.0.0/24`.
-
-### Step 6 — Verify on the server
-
-```bash
+sudo ./openvpn-install.sh client list
 sudo cat /var/log/openvpn/openvpn-status.log
 ```
 
-Look for the client name under `CLIENT_LIST`.
-
 ---
 
-## Add more clients later
-
-Repeat Part 2 with a new name:
+## More clients, revoke, list
 
 ```bash
-CLIENT_NAME="bob"
-VPN_SERVER_IP="YOUR.ELASTIC.IP.HERE"
+# another person
+sudo ./openvpn-install.sh client add bob
 
-cd /etc/openvpn/easy-rsa
-sudo ./easyrsa --batch build-client-full "$CLIENT_NAME" nopass
+# see everyone
+sudo ./openvpn-install.sh client list
+
+# remove access (lost laptop / offboarding)
+sudo ./openvpn-install.sh client revoke alice
 ```
 
-Then run the same `tee ... ${CLIENT_NAME}.ovpn` block from Step 3 and copy the new file to that person.
+One `.ovpn` per person. Do not share the same file.
 
-Never reuse one `.ovpn` file for two people. If a laptop is lost, revoke that one certificate (below) instead of rebuilding the whole server.
-
----
-
-## Revoke a client
+Optional: password-protect the client key:
 
 ```bash
-cd /etc/openvpn/easy-rsa
-sudo ./easyrsa --batch revoke alice
-sudo ./easyrsa gen-crl
-sudo cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
-sudo chmod 644 /etc/openvpn/server/crl.pem
-sudo systemctl restart openvpn-server@server
+sudo ./openvpn-install.sh client add alice --password
 ```
 
-That client can no longer connect. Other clients are unchanged.
-
 ---
 
-## Quick troubleshooting
+## Notes
 
-| Symptom | Check |
-| --- | --- |
-| Service will not start | `sudo journalctl -u openvpn-server@server -e --no-pager` |
-| Client times out | Security group **UDP 1194**, instance public IP / Elastic IP, `ss -ulnp \| grep 1194` |
-| Connects but no internet | `cat /proc/sys/net/ipv4/ip_forward` must be `1`; NAT rule on the default interface; source/destination check **disabled** |
-| Connects but cannot reach VPC | `push "route ..."` CIDR matches the VPC; route table has `10.8.0.0/24` → this instance |
-| Permission errors on certs | Keys live under `/etc/openvpn/server/`, mode `600` on `server.key` |
-
----
-
-## Security notes
-
-- Treat `/etc/openvpn/easy-rsa/pki/` as secret. A leaked CA key can mint new clients.
-- Prefer locking UDP `1194` to known client IPs when you can.
-- Use one certificate per person/device and revoke on offboarding.
-- Keep Amazon Linux patched: `sudo dnf update -y`.
+- Keep `openvpn-install.sh` on the server. You will use it every time you add or revoke a client.
+- Do not commit `.ovpn` files, keys, or certificates.
+- If you enable `openvpn-auth-oauth2`, stay on **v1.27.4+** and the **management interface** (`tcp://127.0.0.1:1195`). Do not use `via-env`.
