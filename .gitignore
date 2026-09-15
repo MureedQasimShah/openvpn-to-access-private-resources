@@ -1,0 +1,11 @@
+# Never commit VPN keys, certificates, or client profiles
+*.key
+*.crt
+*.pem
+*.ovpn
+pki/
+easy-rsa/
+EasyRSA-*/
+client-configs/
+*.tgz
+*.tar.gz
