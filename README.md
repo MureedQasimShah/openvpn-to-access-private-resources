@@ -13,7 +13,6 @@ Auth is certificate-based (`.ovpn` profile). There is no SSO.
 - EC2 — Amazon Linux 2023 (`t3.small` or larger) in a **public subnet** of the VPC
 - Elastic IP on that instance
 - SSH with sudo
-- DNS A record: `pritunl.gocompliance.com` → Elastic IP
 - The servers you want to reach stay in a **private subnet** (no public IP)
 
 VPN server security group (`openvpn-sg`) — inbound only:
